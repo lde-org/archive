@@ -73,13 +73,13 @@ ffi.cdef [[
 ---@field version  string
 
 ---@type fun(...): ZipLocal
-local ZipLocalT  = ffi.typeof("ZipLocal")
+local ZipLocalT     = ffi.typeof("ZipLocal")
 ---@type fun(...): ZipCD
-local ZipCDT     = ffi.typeof("ZipCD")
+local ZipCDT        = ffi.typeof("ZipCD")
 ---@type fun(...): ZipEOCD
-local ZipEOCDT   = ffi.typeof("ZipEOCD")
+local ZipEOCDT      = ffi.typeof("ZipEOCD")
 ---@type fun(): TarHeader
-local TarHeaderT = ffi.typeof("TarHeader")
+local TarHeaderT    = ffi.typeof("TarHeader")
 
 local tarHeaderSize = ffi.sizeof("TarHeader")
 
@@ -98,7 +98,7 @@ end
 ---@param toPath string
 ---@param strip  boolean
 local function zipExtract(data, toPath, strip)
-	local dptr   = ffi.cast("const uint8_t *", data)
+	local dptr    = ffi.cast("const uint8_t *", data)
 	local eocdOff = #data - 22
 	while eocdOff >= 0 and ffi.cast("ZipEOCD *", dptr + eocdOff).sig ~= 0x06054b50 do
 		eocdOff = eocdOff - 1
@@ -132,15 +132,15 @@ end
 ---@param files  table<string, string>
 ---@param toPath string
 local function zipSave(files, toPath)
-	local out   = buf.new()
-	local cdBuf = buf.new()
+	local out           = buf.new()
+	local cdBuf         = buf.new()
 	local offset, count = 0, 0
 
 	for name, content in pairs(files) do
 		local comp = deflate.deflateCompress(content, 6)
 		local crc  = deflate.crc32(content)
 
-		local lh = ZipLocalT(0x04034b50, 20, 0, 8, 0, 0, crc, #comp, #content, #name, 0)
+		local lh   = ZipLocalT(0x04034b50, 20, 0, 8, 0, 0, crc, #comp, #content, #name, 0)
 		out:putcdata(lh, ffi.sizeof(lh)); out:put(name, comp)
 
 		local cd = ZipCDT(0x02014b50, 20, 20, 0, 8, 0, 0, crc, #comp, #content, #name, 0, 0, 0, 0, 0, offset)
@@ -168,7 +168,9 @@ local function tarExtract(data, toPath, strip)
 		---@type TarHeader
 		local h = ffi.cast("TarHeader *", dptr + pos)
 		if h.name[0] == 0 then break end
+		local prefix = ffi.string(h.prefix)
 		local name = ffi.string(h.name)
+		if #prefix > 0 then name = prefix .. "/" .. name end
 		local size = tonumber(ffi.string(h.size, 11), 8) or 0
 		pos = pos + tarHeaderSize
 		if strip then name = name:match("^[^/]*/(.+)") or name end
@@ -190,15 +192,33 @@ local function tarSave(files, toPath)
 	for name, content in pairs(files) do
 		---@type TarHeader
 		local h = TarHeaderT()
-		ffi.copy(h.name,     name,                             math.min(#name, 100))
-		ffi.copy(h.mode,     "0000644\0",                      8)
-		ffi.copy(h.size,     string.format("%011o", #content), 11)
-		ffi.copy(h.mtime,    "00000000000",                    11)
-		ffi.copy(h.magic,    "ustar",                          5)
-		ffi.copy(h.version,  "00",                             2)
+		if #name <= 100 then
+			ffi.copy(h.name, name, #name)
+		else
+			local split = nil
+			for i = math.min(155, #name), 1, -1 do
+				if name:byte(i) == string.byte("/") then
+					if i - 1 <= 155 and #name - i <= 100 then
+						split = i
+						break
+					end
+				end
+			end
+			if split then
+				ffi.copy(h.prefix, name:sub(1, split - 1), split - 1)
+				ffi.copy(h.name, name:sub(split + 1), #name - split)
+			else
+				ffi.copy(h.name, name, math.min(#name, 100))
+			end
+		end
+		ffi.copy(h.mode, "0000644\0", 8)
+		ffi.copy(h.size, string.format("%011o", #content), 11)
+		ffi.copy(h.mtime, "00000000000", 11)
+		ffi.copy(h.magic, "ustar", 5)
+		ffi.copy(h.version, "00", 2)
 		h.typeflag = string.byte("0")
-		local sum = 8 * 32
-		local hp  = ffi.cast("const uint8_t *", h)
+		local sum  = 8 * 32
+		local hp   = ffi.cast("const uint8_t *", h)
 		for i = 0, tarHeaderSize - 1 do sum = sum + hp[i] end
 		ffi.copy(h.checksum, string.format("%06o\0 ", sum), 8)
 		out:putcdata(h, tarHeaderSize)
@@ -247,7 +267,8 @@ function Archive:extract(toPath, opts)
 		if ffi.cast("const uint32_t *", data)[0] == 0x04034b50 then
 			zipExtract(data, toPath, strip)
 		else
-			local raw = data:sub(1, 2) == "\31\139" and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024)) or data
+			local raw = data:sub(1, 2) == "\31\139" and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024)) or
+			data
 			tarExtract(raw, toPath, strip)
 		end
 	end)

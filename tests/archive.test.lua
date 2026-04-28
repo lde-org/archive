@@ -151,3 +151,43 @@ test.it("stripComponents strips top-level dir from tar.gz", function()
 	b:extract(outDir, { stripComponents = true })
 	test.equal(fs.read(path.join(outDir, "hello.txt")), "stripped")
 end)
+
+-- tar names longer than 100 chars must use the prefix field,
+-- otherwise the name is truncated and extraction produces wrong results
+test.it("tar roundtrip with filename longer than 100 characters", function()
+	local tarPath = tmp("longname.tar")
+	local outDir  = tmp("out-longname-tar")
+	fs.mkdir(outDir)
+
+	local longDir  = string.rep("a", 80)
+	local fileName = string.rep("b", 30) .. ".txt"
+	local fullPath = longDir .. "/" .. fileName -- > 100 chars
+	test.truthy(#fullPath > 100)
+
+	local a = Archive.new({ [fullPath] = "long tar content" })
+	a:save(tarPath)
+
+	local b = Archive.new(tarPath)
+	local ok = b:extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, fullPath)), "long tar content")
+end)
+
+test.it("tar.gz roundtrip with filename longer than 100 characters", function()
+	local tarPath = tmp("longname.tar.gz")
+	local outDir  = tmp("out-longname-targz")
+	fs.mkdir(outDir)
+
+	local longDir  = string.rep("a", 80)
+	local fileName = string.rep("b", 30) .. ".txt"
+	local fullPath = longDir .. "/" .. fileName -- > 100 chars
+	test.truthy(#fullPath > 100)
+
+	local a = Archive.new({ [fullPath] = "long tar.gz content" })
+	a:save(tarPath)
+
+	local b = Archive.new(tarPath)
+	local ok = b:extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, fullPath)), "long tar.gz content")
+end)
