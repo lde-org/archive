@@ -191,3 +191,37 @@ test.it("tar.gz roundtrip with filename longer than 100 characters", function()
 	test.truthy(ok)
 	test.equal(fs.read(path.join(outDir, fullPath)), "long tar.gz content")
 end)
+
+-- regression: extract real tar.gz files created by system tar with names > 100 chars
+-- verifies that the prefix field in ustar headers is correctly read and reassembled
+test.it("extracts real tar.gz with filename longer than 100 characters", function()
+	local tarPath = "tests/data/longname-real.tar.gz"
+	local outDir  = tmp("out-real-targz")
+	fs.mkdir(outDir)
+
+	local longDir  = string.rep("a", 80)
+	local fileName = string.rep("b", 30) .. ".txt"
+	local fullPath = longDir .. "/" .. fileName
+
+	local b        = Archive.new(tarPath)
+	local ok       = b:extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, fullPath)), "long path content from real tar\n")
+	test.equal(fs.read(path.join(outDir, "short.txt")), "short content\n")
+end)
+
+test.it("extracts real .tar with filename longer than 100 characters", function()
+	local tarPath = "tests/data/longname-real.tar"
+	local outDir  = tmp("out-real-tar")
+	fs.mkdir(outDir)
+
+	local longDir  = string.rep("a", 80)
+	local fileName = string.rep("b", 30) .. ".txt"
+	local fullPath = longDir .. "/" .. fileName
+
+	local b        = Archive.new(tarPath)
+	local ok       = b:extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, fullPath)), "long path content from real tar\n")
+	test.equal(fs.read(path.join(outDir, "short.txt")), "short content\n")
+end)

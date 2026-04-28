@@ -164,20 +164,27 @@ end
 local function tarExtract(data, toPath, strip)
 	local dptr = ffi.cast("const uint8_t *", data)
 	local pos  = 0
+	local longName = nil
 	while pos + tarHeaderSize <= #data do
 		---@type TarHeader
 		local h = ffi.cast("TarHeader *", dptr + pos)
 		if h.name[0] == 0 then break end
-		local prefix = ffi.string(h.prefix)
-		local name = ffi.string(h.name)
-		if #prefix > 0 then name = prefix .. "/" .. name end
 		local size = tonumber(ffi.string(h.size, 11), 8) or 0
 		pos = pos + tarHeaderSize
-		if strip then name = name:match("^[^/]*/(.+)") or name end
-		if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
-			fs.mkdir(path.join(toPath, name))
-		elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
-			writeFile(toPath, name, ffi.string(dptr + pos, size))
+		if h.typeflag == string.byte("L") then
+			longName = ffi.string(dptr + pos, size):match("^([^%z]*)")
+		else
+			local prefix = ffi.string(h.prefix)
+			local name = ffi.string(h.name)
+			if #prefix > 0 then name = prefix .. "/" .. name end
+			if longName then name = longName end
+			if strip then name = name:match("^[^/]*/(.+)") or name end
+			if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
+				fs.mkdir(path.join(toPath, name))
+			elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
+				writeFile(toPath, name, ffi.string(dptr + pos, size))
+			end
+			longName = nil
 		end
 		pos = pos + math.ceil(size / 512) * 512
 	end
