@@ -162,8 +162,8 @@ end
 ---@param toPath string
 ---@param strip  boolean
 local function tarExtract(data, toPath, strip)
-	local dptr = ffi.cast("const uint8_t *", data)
-	local pos  = 0
+	local dptr     = ffi.cast("const uint8_t *", data)
+	local pos      = 0
 	local longName = nil
 	while pos + tarHeaderSize <= #data do
 		---@type TarHeader
@@ -174,8 +174,8 @@ local function tarExtract(data, toPath, strip)
 		if h.typeflag == string.byte("L") then
 			longName = ffi.string(dptr + pos, size):match("^([^%z]*)")
 		else
-			local prefix = ffi.string(h.prefix)
-			local name = ffi.string(h.name)
+			local prefix = ffi.string(h.prefix, 155):match("^([^%z]*)")
+			local name = ffi.string(h.name, 100):match("^([^%z]*)")
 			if #prefix > 0 then name = prefix .. "/" .. name end
 			if longName then name = longName end
 			if strip then name = name:match("^[^/]*/(.+)") or name end

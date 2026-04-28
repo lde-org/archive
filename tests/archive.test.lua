@@ -225,3 +225,24 @@ test.it("extracts real .tar with filename longer than 100 characters", function(
 	test.equal(fs.read(path.join(outDir, fullPath)), "long path content from real tar\n")
 	test.equal(fs.read(path.join(outDir, "short.txt")), "short content\n")
 end)
+
+-- regression: a filename that exactly fills the 100-byte name field (no nul
+-- terminator) must not bleed into the adjacent mode field in the tar header
+test.it("tar roundtrip with exactly 100 character filename", function()
+	local tarPath = tmp("exact100.tar")
+	local outDir  = tmp("out-exact100")
+	fs.mkdir(outDir)
+
+	local dirName  = string.rep("d", 56)
+	local baseName = string.rep("f", 39) .. ".txt"
+	local fullPath = dirName .. "/" .. baseName -- exactly 100 chars
+	test.equal(#fullPath, 100)
+
+	local a = Archive.new({ [fullPath] = "exact 100 char name" })
+	a:save(tarPath)
+
+	local b = Archive.new(tarPath)
+	local ok = b:extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, fullPath)), "exact 100 char name")
+end)
