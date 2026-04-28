@@ -258,20 +258,24 @@ end
 function Archive:extract(toPath, opts)
 	local src = self._source
 	if type(src) ~= "string" then return false, "extract() is only valid for file-backed archives" end
-	local f = io.open(src, "rb")
-	if not f then return false, "cannot open: " .. src end
-	local data = f:read("*a"); f:close()
+
+	local data = fs.read(src)
+	if not data then return false, "cannot open: " .. src end
+
 	local strip = opts and opts.stripComponents or false
 	fs.mkdir(toPath)
 	local ok, err = pcall(function()
 		if ffi.cast("const uint32_t *", data)[0] == 0x04034b50 then
 			zipExtract(data, toPath, strip)
 		else
-			local raw = data:sub(1, 2) == "\31\139" and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024)) or
-			data
+			local raw = data:sub(1, 2) == "\31\139"
+				and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024))
+				or data
+
 			tarExtract(raw, toPath, strip)
 		end
 	end)
+
 	if not ok then return false, err end
 	return true
 end
