@@ -246,3 +246,40 @@ test.it("tar roundtrip with exactly 100 character filename", function()
 	test.truthy(ok)
 	test.equal(fs.read(path.join(outDir, fullPath)), "exact 100 char name")
 end)
+
+--
+-- Regression: extraction must preserve POSIX exec bits. Real src rocks ship
+-- executable scripts (e.g. cqueues' mk/luapath) in nested tar.gz/zips; losing
+-- the mode breaks their makefiles. Fixtures: tests/data/mode-real.{tar.gz,zip}.
+--
+
+---@param p string
+---@return number?  -- permission bits (lower 9), or nil if stat failed
+local function perms(p)
+	local stat = fs.stat(p)
+	return stat and stat.mode and (stat.mode % 512) or nil
+end
+
+test.it("extracts real tar.gz and preserves exec bits", function()
+	local outDir = tmp("out-mode-tar")
+	fs.mkdir(outDir)
+
+	local ok = Archive.new("tests/data/mode-real.tar.gz"):extract(outDir)
+	test.truthy(ok)
+
+	test.equal(perms(path.join(outDir, "tool.sh")), tonumber("755", 8))
+	test.equal(perms(path.join(outDir, "readme.txt")), tonumber("644", 8))
+	test.equal(perms(path.join(outDir, "run")), tonumber("700", 8))
+end)
+
+test.it("extracts real zip and preserves exec bits", function()
+	local outDir = tmp("out-mode-zip")
+	fs.mkdir(outDir)
+
+	local ok = Archive.new("tests/data/mode-real.zip"):extract(outDir)
+	test.truthy(ok)
+
+	test.equal(perms(path.join(outDir, "tool.sh")), tonumber("755", 8))
+	test.equal(perms(path.join(outDir, "readme.txt")), tonumber("644", 8))
+	test.equal(perms(path.join(outDir, "run")), tonumber("700", 8))
+end)

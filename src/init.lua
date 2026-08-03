@@ -1,6 +1,7 @@
 ---@diagnostic disable: assign-type-mismatch
 
 local ffi     = require("ffi")
+local bit     = require("bit")
 local buf     = require("string.buffer")
 local deflate = require("deflate-sys")
 local fs      = require("fs")
@@ -32,6 +33,11 @@ ffi.cdef [[
          uname[32], gname[32], devmajor[8], devminor[8], prefix[155], pad[12];
   } TarHeader;
 ]]
+
+ffi.cdef [[
+  int chmod(const char *path, unsigned int mode);
+]]
+
 
 ---@class ZipLocal: ffi.cdata*
 ---@field sig       number
@@ -83,13 +89,30 @@ local TarHeaderT    = ffi.typeof("TarHeader")
 
 local tarHeaderSize = ffi.sizeof("TarHeader")
 
+--- Apply a POSIX permission mask to an extracted file. Exec bits matter for
+--- scripts shipped inside src rocks (e.g. cqueues' mk/luapath). No-op on
+--- Windows and for masks that carry no permission bits.
+---@param out string
+---@param mode number?
+local function applyMode(out, mode)
+	if jit.os == "Windows" then return end
+	local mask = tonumber(mode)
+	if not mask or mask <= 0 then return end
+	local perms = mask % 512 -- keep rwxrwxrwx
+	if perms ~= 0 then
+		ffi.C.chmod(out, perms)
+	end
+end
+
 ---@param base    string
 ---@param name    string
 ---@param content string
-local function writeFile(base, name, content)
+---@param mode    number?
+local function writeFile(base, name, content, mode)
 	local out = path.join(base, name)
 	fs.mkdirAll(path.dirname(out))
 	fs.write(out, content)
+	applyMode(out, mode)
 end
 
 -- ── ZIP extract ───────────────────────────────────────────────────────────────
@@ -119,7 +142,7 @@ local function zipExtract(data, toPath, strip)
 			local lh      = ffi.cast("ZipLocal *", dptr + e.offset)
 			local raw     = ffi.string(dptr + e.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, e.compSize)
 			local content = e.method == 0 and raw or deflate.deflateDecompress(raw, e.uncompSize)
-			writeFile(toPath, name, content)
+			writeFile(toPath, name, content, bit.rshift(e.eattr, 16)) -- high 16 bits carry the unix mode
 		else
 			fs.mkdir(path.join(toPath, name))
 		end
@@ -182,7 +205,7 @@ local function tarExtract(data, toPath, strip)
 			if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
 				fs.mkdir(path.join(toPath, name))
 			elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
-				writeFile(toPath, name, ffi.string(dptr + pos, size))
+				writeFile(toPath, name, ffi.string(dptr + pos, size), tonumber(ffi.string(h.mode, 8), 8))
 			end
 			longName = nil
 		end
