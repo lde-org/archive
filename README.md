@@ -22,6 +22,23 @@ if not ok then error(err) end
 Archive.new("file.tar.gz"):extract("output/dir", { stripComponents = true })
 ```
 
+**Open an archive from raw contents (no file needed):**
+
+```lua
+local Archive = require("archive")
+
+local raw = http.fetch(url) -- or fs.read("file.zip") — any raw bytes
+local zip = Archive.new(raw) -- strings with a known magic are treated as contents
+
+-- Read a file straight from memory, without extracting to disk
+local init = zip:read("src/init.lua")
+```
+
+`Archive.new` treats a string as raw archive contents when it starts with a
+known archive magic (zip `PK..`, gzip, or tar `ustar`); anything else is
+treated as a file path. `read()` works for raw contents, paths, and
+table-backed archives alike, returning `nil` when the entry does not exist.
+
 **Create and save an archive:**
 
 ```lua

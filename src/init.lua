@@ -115,12 +115,17 @@ local function writeFile(base, name, content, mode)
 	applyMode(out, mode)
 end
 
--- ── ZIP extract ───────────────────────────────────────────────────────────────
+-- ── ZIP entries ───────────────────────────────────────────────────────────────
 
----@param data   string
----@param toPath string
----@param strip  boolean
-local function zipExtract(data, toPath, strip)
+---@class Archive.Entry
+---@field content string? # Decompressed file bytes (nil for directory entries)
+---@field mode number?    # POSIX permission bits (zip external attrs / tar mode)
+---@field dir boolean?    # True for directory entries
+
+--- Parse a zip archive into a flat table of `{ [name] = Entry }`.
+---@param data string
+---@return table<string, Archive.Entry>
+local function zipEntries(data)
 	local dptr    = ffi.cast("const uint8_t *", data)
 	local eocdOff = #data - 22
 	while eocdOff >= 0 and ffi.cast("ZipEOCD *", dptr + eocdOff).sig ~= 0x06054b50 do
@@ -131,23 +136,26 @@ local function zipExtract(data, toPath, strip)
 	local eocd = ffi.cast("ZipEOCD *", dptr + eocdOff)
 	local cd   = ffi.cast("const uint8_t *", dptr + eocd.cdOffset)
 
+	local entries = {}
 	for _ = 1, eocd.total do
 		---@type ZipCD
 		local e = ffi.cast("ZipCD *", cd)
 		assert(e.sig == 0x02014b50, "ZIP: bad CD entry")
 		local name = ffi.string(cd + ffi.sizeof("ZipCD"), e.nameLen)
-		if strip then name = name:match("^[^/]*/(.+)") or name end
-		if name:sub(-1) ~= "/" then
-			---@type ZipLocal
-			local lh      = ffi.cast("ZipLocal *", dptr + e.offset)
-			local raw     = ffi.string(dptr + e.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, e.compSize)
-			local content = e.method == 0 and raw or deflate.deflateDecompress(raw, e.uncompSize)
-			writeFile(toPath, name, content, bit.rshift(e.eattr, 16)) -- high 16 bits carry the unix mode
+		if name:sub(-1) == "/" then
+			entries[name] = { dir = true }
 		else
-			fs.mkdir(path.join(toPath, name))
+			---@type ZipLocal
+			local lh  = ffi.cast("ZipLocal *", dptr + e.offset)
+			local raw = ffi.string(dptr + e.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, e.compSize)
+			entries[name] = {
+				content = e.method == 0 and raw or deflate.deflateDecompress(raw, e.uncompSize),
+				mode    = bit.rshift(e.eattr, 16), -- high 16 bits carry the unix mode
+			}
 		end
 		cd = cd + ffi.sizeof("ZipCD") + e.nameLen + e.extraLen + e.commentLen
 	end
+	return entries
 end
 
 -- ── ZIP save ──────────────────────────────────────────────────────────────────
@@ -179,15 +187,16 @@ local function zipSave(files, toPath)
 	return fs.write(toPath, out:tostring())
 end
 
--- ── TAR extract ───────────────────────────────────────────────────────────────
+-- ── TAR entries ───────────────────────────────────────────────────────────────
 
----@param data   string
----@param toPath string
----@param strip  boolean
-local function tarExtract(data, toPath, strip)
+--- Parse a tar archive into a flat table of `{ [name] = Entry }`.
+---@param data string
+---@return table<string, Archive.Entry>
+local function tarEntries(data)
 	local dptr     = ffi.cast("const uint8_t *", data)
 	local pos      = 0
 	local longName = nil
+	local entries  = {}
 	while pos + tarHeaderSize <= #data do
 		---@type TarHeader
 		local h = ffi.cast("TarHeader *", dptr + pos)
@@ -201,16 +210,35 @@ local function tarExtract(data, toPath, strip)
 			local name = ffi.string(h.name, 100):match("^([^%z]*)")
 			if #prefix > 0 then name = prefix .. "/" .. name end
 			if longName then name = longName end
-			if strip then name = name:match("^[^/]*/(.+)") or name end
 			if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
-				fs.mkdir(path.join(toPath, name))
+				entries[name] = { dir = true }
 			elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
-				writeFile(toPath, name, ffi.string(dptr + pos, size), tonumber(ffi.string(h.mode, 8), 8))
+				entries[name] = {
+					content = ffi.string(dptr + pos, size),
+					mode    = tonumber(ffi.string(h.mode, 8), 8),
+				}
 			end
 			longName = nil
 		end
 		pos = pos + math.ceil(size / 512) * 512
 	end
+	return entries
+end
+
+-- ── decode ────────────────────────────────────────────────────────────────────
+
+--- Detect the format from magic bytes and decode into a flat entry table.
+---@param data string
+---@return table<string, Archive.Entry>
+local function decode(data)
+	local a, b, c, d = data:byte(1, 4)
+	if a == 0x50 and b == 0x4B and ((c == 0x03 and d == 0x04) or (c == 0x05 and d == 0x06)) then
+		return zipEntries(data)
+	end
+	local raw = a == 0x1F and b == 0x8B
+		and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024))
+		or data
+	return tarEntries(raw)
 end
 
 -- ── TAR save ─────────────────────────────────────────────────────────────────
@@ -265,19 +293,66 @@ end
 -- ── Archive ───────────────────────────────────────────────────────────────────
 
 ---@class Archive
----@field _source string | table<string, string>
+---@field _source string | table<string, string>? # Path to decode, or `{ [path] = content }` to encode
+---@field _data string? # Raw archive bytes when constructed from content
 local Archive = {}
 Archive.__index = Archive
 
 ---@class Archive.ExtractOptions
 ---@field stripComponents boolean?
 
+--- Heuristic: does the string look like raw archive bytes rather than a path?
+--- Matches zip local headers / empty-zip EOCDs ("PK.."), gzip streams, and
+--- tar headers (the "ustar" magic at offset 257).
+---@param s string
+---@return boolean
+local function looksLikeContent(s)
+	if #s < 4 then return false end
+	local a, b, c, d = s:byte(1, 4)
+	if a == 0x50 and b == 0x4B and ((c == 0x03 and d == 0x04) or (c == 0x05 and d == 0x06)) then
+		return true
+	end
+	if a == 0x1F and b == 0x8B then return true end
+	return #s >= 262 and s:sub(258, 262) == "ustar"
+end
+
 --- Create a new Archive.
---- Pass a file path string to decode, or a table of `{ [path] = content }` to encode.
+--- Pass a file path string to decode, a raw archive byte string to decode in
+--- memory, or a table of `{ [path] = content }` to encode. Strings that begin
+--- with a known archive magic (zip, gzip, or tar) are treated as raw contents;
+--- anything else is treated as a path.
 ---@param source string | table<string, string>
 ---@return Archive
 function Archive.new(source)
-	return setmetatable({ _source = source }, Archive)
+	local self = setmetatable({}, Archive)
+	if type(source) == "string" and looksLikeContent(source) then
+		self._data = source
+	else
+		self._source = source
+	end
+	return self
+end
+
+--- Decode the archive's data (raw bytes, or read from the backing file)
+--- into a flat table of `{ [name] = Entry }`.
+---@return table<string, Archive.Entry>?
+---@return string? err
+function Archive:_decode()
+	local data
+	if self._data then
+		data = self._data
+	else
+		local src = self._source
+		if type(src) == "string" then
+			data = fs.read(src)
+			if not data then return nil, "cannot open: " .. src end
+		else
+			return nil, "archive is not backed by file data"
+		end
+	end
+	local ok, res = pcall(decode, data)
+	if not ok then return nil, tostring(res) end
+	return res
 end
 
 --- Extract the archive to the given output directory.
@@ -286,28 +361,46 @@ end
 ---@return boolean ok
 ---@return string? err
 function Archive:extract(toPath, opts)
-	local src = self._source
-	if type(src) ~= "string" then return false, "extract() is only valid for file-backed archives" end
+	if type(self._source) == "table" then
+		return false, "extract() is only valid for file-backed archives"
+	end
 
-	local data = fs.read(src)
-	if not data then return false, "cannot open: " .. src end
-
-	local strip = opts and opts.stripComponents or false
-	fs.mkdir(toPath)
 	local ok, err = pcall(function()
-		if ffi.cast("const uint32_t *", data)[0] == 0x04034b50 then
-			zipExtract(data, toPath, strip)
-		else
-			local raw = data:sub(1, 2) == "\31\139"
-				and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024))
-				or data
+		local entries, derr = self:_decode()
+		if not entries then error(derr) end
 
-			tarExtract(raw, toPath, strip)
+		local strip = opts and opts.stripComponents or false
+		fs.mkdir(toPath)
+		for name, entry in pairs(entries) do
+			if strip then name = name:match("^[^/]*/(.+)") or name end
+			if entry.dir then
+				fs.mkdirAll(path.join(toPath, name))
+			else
+				writeFile(toPath, name, entry.content, entry.mode)
+			end
 		end
 	end)
 
 	if not ok then return false, err end
 	return true
+end
+
+--- Read a single file's contents by name without extracting to disk.
+--- For table-backed archives this is a direct lookup.
+---@param name string
+---@return string? content
+---@return string? err
+function Archive:read(name)
+	if type(self._source) == "table" then
+		local content = self._source[name]
+		return type(content) == "string" and content or nil
+	end
+
+	local entries, err = self:_decode()
+	if not entries then return nil, err end
+	local entry = entries[name]
+	if not entry or entry.dir then return nil end
+	return entry.content
 end
 
 --- Save the in-memory file table to an archive.

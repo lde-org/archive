@@ -283,3 +283,99 @@ test.it("extracts real zip and preserves exec bits", function()
 	test.equal(perms(path.join(outDir, "readme.txt")), tonumber("644", 8))
 	test.equal(perms(path.join(outDir, "run")), tonumber("700", 8))
 end)
+
+--
+-- Raw content archives: Archive.new(bytes) instead of Archive.new(path).
+-- Strings that start with a known archive magic are treated as contents, so
+-- they are decoded from memory and never hit the filesystem.
+--
+
+test.it("reads files from raw zip bytes without touching the fs", function()
+	local zipPath = tmp("raw-read.zip")
+	Archive.new({ ["f.lua"] = "local x = 1\n", ["lib/util.lua"] = "return 2\n" }):save(zipPath)
+	local raw = fs.read(zipPath)
+	fs.delete(zipPath) -- if Archive.new treated the bytes as a path, read() would fail here
+
+	local a = Archive.new(raw)
+	test.equal(a:read("f.lua"), "local x = 1\n")
+	test.equal(a:read("lib/util.lua"), "return 2\n")
+	test.falsy(a:read("nope.lua"))
+end)
+
+test.it("extracts raw zip bytes to disk", function()
+	local zipPath = tmp("raw-extract.zip")
+	Archive.new({ ["hello.txt"] = "raw zip content" }):save(zipPath)
+	local raw = fs.read(zipPath)
+	fs.delete(zipPath)
+
+	local outDir = tmp("out-raw-zip")
+	fs.mkdir(outDir)
+	local ok = Archive.new(raw):extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "raw zip content")
+end)
+
+test.it("reads files from raw tar.gz bytes", function()
+	local tarPath = tmp("raw-read.tar.gz")
+	Archive.new({ ["f.lua"] = "local y = 2\n" }):save(tarPath)
+	local raw = fs.read(tarPath)
+	fs.delete(tarPath)
+
+	test.equal(Archive.new(raw):read("f.lua"), "local y = 2\n")
+end)
+
+test.it("reads files from raw tar bytes", function()
+	local tarPath = tmp("raw-read.tar")
+	Archive.new({ ["f.lua"] = "tar content" }):save(tarPath)
+	local raw = fs.read(tarPath)
+	fs.delete(tarPath)
+
+	test.equal(Archive.new(raw):read("f.lua"), "tar content")
+end)
+
+test.it("extracts raw tar.gz bytes to disk", function()
+	local tarPath = tmp("raw-extract.tar.gz")
+	Archive.new({ ["hello.txt"] = "raw tar content" }):save(tarPath)
+	local raw = fs.read(tarPath)
+	fs.delete(tarPath)
+
+	local outDir = tmp("out-raw-tar")
+	fs.mkdir(outDir)
+	local ok = Archive.new(raw):extract(outDir)
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "raw tar content")
+end)
+
+test.it("handles raw empty zip contents", function()
+	local zipPath = tmp("raw-empty.zip")
+	Archive.new({}):save(zipPath)
+	local raw = fs.read(zipPath)
+	fs.delete(zipPath)
+	test.equal(raw:sub(1, 2), "PK")
+
+	local outDir = tmp("out-raw-empty")
+	fs.mkdir(outDir)
+	test.truthy(Archive.new(raw):extract(outDir))
+	test.falsy(Archive.new(raw):read("x"))
+end)
+
+test.it("read() on a table-backed archive is a direct lookup", function()
+	local a = Archive.new({ ["hello.txt"] = "hello" })
+	test.equal(a:read("hello.txt"), "hello")
+	test.falsy(a:read("missing.txt"))
+end)
+
+test.it("read() from a path-backed archive", function()
+	local zipPath = tmp("path-read.zip")
+	Archive.new({ ["f.lua"] = "from path" }):save(zipPath)
+	test.equal(Archive.new(zipPath):read("f.lua"), "from path")
+end)
+
+test.it("save fails when constructed from raw content", function()
+	local zipPath = tmp("raw-save.zip")
+	Archive.new({ ["hello.txt"] = "hi" }):save(zipPath)
+	local raw = fs.read(zipPath)
+	local ok, err = Archive.new(raw):save(tmp("out.zip"))
+	test.falsy(ok)
+	test.truthy(err)
+end)
