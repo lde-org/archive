@@ -59,6 +59,7 @@ ffi.cdef [[
 ---@field extraLen   number
 ---@field commentLen number
 ---@field method     number
+---@field eattr      number
 ---@field offset     number
 
 ---@class ZipEOCD: ffi.cdata*
@@ -77,6 +78,7 @@ ffi.cdef [[
 ---@field typeflag number
 ---@field magic    string
 ---@field version  string
+---@field prefix   string
 
 ---@type fun(...): ZipLocal
 local ZipLocalT     = ffi.typeof("ZipLocal")
@@ -122,10 +124,20 @@ end
 ---@field mode number?    # POSIX permission bits (zip external attrs / tar mode)
 ---@field dir boolean?    # True for directory entries
 
---- Parse a zip archive into a flat table of `{ [name] = Entry }`.
+---@class Archive.ZipEntryInfo
+---@field name string
+---@field dir boolean
+---@field method number
+---@field compSize number
+---@field uncompSize number
+---@field mode number?
+---@field offset number
+
+--- Walk a zip archive's central directory, returning entry descriptors in
+--- archive order. Keeps only metadata in memory; entry data is read lazily.
 ---@param data string
----@return table<string, Archive.Entry>
-local function zipEntries(data)
+---@return Archive.ZipEntryInfo[]
+local function zipCDEntries(data)
 	local dptr    = ffi.cast("const uint8_t *", data)
 	local eocdOff = #data - 22
 	while eocdOff >= 0 and ffi.cast("ZipEOCD *", dptr + eocdOff).sig ~= 0x06054b50 do
@@ -142,18 +154,38 @@ local function zipEntries(data)
 		local e = ffi.cast("ZipCD *", cd)
 		assert(e.sig == 0x02014b50, "ZIP: bad CD entry")
 		local name = ffi.string(cd + ffi.sizeof("ZipCD"), e.nameLen)
-		if name:sub(-1) == "/" then
-			entries[name] = { dir = true }
+		entries[#entries + 1] = {
+			name       = name,
+			dir        = name:sub(-1) == "/",
+			method     = e.method,
+			compSize   = e.compSize,
+			uncompSize = e.uncompSize,
+			mode       = bit.rshift(e.eattr, 16), -- high 16 bits carry the unix mode
+			offset     = e.offset,
+		}
+		cd = cd + ffi.sizeof("ZipCD") + e.nameLen + e.extraLen + e.commentLen
+	end
+	return entries
+end
+
+--- Parse a zip archive into a flat table of `{ [name] = Entry }`.
+---@param data string
+---@return table<string, Archive.Entry>
+local function zipEntries(data)
+	local dptr    = ffi.cast("const uint8_t *", data)
+	local entries = {}
+	for _, info in ipairs(zipCDEntries(data)) do
+		if info.dir then
+			entries[info.name] = { dir = true }
 		else
 			---@type ZipLocal
-			local lh  = ffi.cast("ZipLocal *", dptr + e.offset)
-			local raw = ffi.string(dptr + e.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, e.compSize)
-			entries[name] = {
-				content = e.method == 0 and raw or deflate.deflateDecompress(raw, e.uncompSize),
-				mode    = bit.rshift(e.eattr, 16), -- high 16 bits carry the unix mode
+			local lh  = ffi.cast("ZipLocal *", dptr + info.offset)
+			local raw = ffi.string(dptr + info.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, info.compSize)
+			entries[info.name] = {
+				content = info.method == 0 and raw or deflate.deflateDecompress(raw, info.uncompSize),
+				mode    = info.mode,
 			}
 		end
-		cd = cd + ffi.sizeof("ZipCD") + e.nameLen + e.extraLen + e.commentLen
 	end
 	return entries
 end
@@ -189,56 +221,229 @@ end
 
 -- ── TAR entries ───────────────────────────────────────────────────────────────
 
+--- Iterate a tar archive's entries lazily, in archive order. Yields
+--- `(name, size, mode, isDir, dataOffset)` for file entries and
+--- `(name, nil, mode, true, nil)` for directories. Handles GNU long names
+--- (typeflag 'L'). File contents are left in the buffer — callers read them
+--- from `dataOffset` and discard them, so only one file is ever materialized
+--- at a time.
+---@param data string
+---@return fun(): string?, number?, number?, boolean?, number??
+local function tarIter(data)
+	local dptr     = ffi.cast("const uint8_t *", data)
+	local pos      = 0
+	local longName = nil
+	return function()
+		while pos + tarHeaderSize <= #data do
+			---@type TarHeader
+			local h = ffi.cast("TarHeader *", dptr + pos)
+			if h.name[0] == 0 then return nil end
+			local size    = tonumber(ffi.string(h.size, 11), 8) or 0
+			local dataOff = pos + tarHeaderSize
+			pos = pos + tarHeaderSize + math.ceil(size / 512) * 512
+			if h.typeflag == string.byte("L") then
+				longName = ffi.string(dptr + dataOff, size):match("^([^%z]*)")
+			else
+				local prefix = ffi.string(h.prefix, 155):match("^([^%z]*)")
+				local name = ffi.string(h.name, 100):match("^([^%z]*)")
+				if #prefix > 0 then name = prefix .. "/" .. name end
+				if longName then name = longName end
+				longName = nil
+				if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
+					return name, nil, tonumber(ffi.string(h.mode, 8), 8), true, nil
+				elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
+					return name, size, tonumber(ffi.string(h.mode, 8), 8), false, dataOff
+				end
+			end
+		end
+		return nil
+	end
+end
+
 --- Parse a tar archive into a flat table of `{ [name] = Entry }`.
 ---@param data string
 ---@return table<string, Archive.Entry>
 local function tarEntries(data)
-	local dptr     = ffi.cast("const uint8_t *", data)
-	local pos      = 0
-	local longName = nil
-	local entries  = {}
-	while pos + tarHeaderSize <= #data do
-		---@type TarHeader
-		local h = ffi.cast("TarHeader *", dptr + pos)
-		if h.name[0] == 0 then break end
-		local size = tonumber(ffi.string(h.size, 11), 8) or 0
-		pos = pos + tarHeaderSize
-		if h.typeflag == string.byte("L") then
-			longName = ffi.string(dptr + pos, size):match("^([^%z]*)")
+	local dptr    = ffi.cast("const uint8_t *", data)
+	local entries = {}
+	for name, size, mode, isDir, dataOff in tarIter(data) do
+		if isDir then
+			entries[name] = { dir = true }
 		else
-			local prefix = ffi.string(h.prefix, 155):match("^([^%z]*)")
-			local name = ffi.string(h.name, 100):match("^([^%z]*)")
-			if #prefix > 0 then name = prefix .. "/" .. name end
-			if longName then name = longName end
-			if h.typeflag == string.byte("5") or name:sub(-1) == "/" then
-				entries[name] = { dir = true }
-			elseif h.typeflag == string.byte("0") or h.typeflag == 0 then
-				entries[name] = {
-					content = ffi.string(dptr + pos, size),
-					mode    = tonumber(ffi.string(h.mode, 8), 8),
-				}
-			end
-			longName = nil
+			entries[name] = {
+				content = ffi.string(dptr + dataOff, size),
+				mode    = mode,
+			}
 		end
-		pos = pos + math.ceil(size / 512) * 512
 	end
 	return entries
 end
 
 -- ── decode ────────────────────────────────────────────────────────────────────
 
+---@alias Archive.Format "zip" | "tar" | "targz"
+
+--- Detect the archive format from its magic bytes.
+---@param data string
+---@return Archive.Format
+local function sniff(data)
+	local a, b, c, d = data:byte(1, 4)
+	if a == 0x50 and b == 0x4B and ((c == 0x03 and d == 0x04) or (c == 0x05 and d == 0x06)) then
+		return "zip"
+	end
+	if a == 0x1F and b == 0x8B then return "targz" end
+	return "tar"
+end
+
+--- Decompress gzip-wrapped tar data; passthrough for plain tar.
+---@param data string
+---@return string
+local function tarData(data)
+	local a, b = data:byte(1, 2)
+	if a == 0x1F and b == 0x8B then
+		-- The gzip footer stores the uncompressed size (ISIZE, mod 2^32). Prefer
+		-- it over guessing from the compressed size, which fails for highly
+		-- compressible payloads (tar.gz of text compresses well past 10x).
+		local maxSize = math.max(#data * 10, 1024 * 1024)
+		if #data >= 18 then
+			local b1, b2, b3, b4 = data:byte(-4, -1)
+			local isize = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+			if isize > 0 then maxSize = isize end
+		end
+		return deflate.gzipDecompress(data, maxSize)
+	end
+	return data
+end
+
 --- Detect the format from magic bytes and decode into a flat entry table.
 ---@param data string
 ---@return table<string, Archive.Entry>
 local function decode(data)
-	local a, b, c, d = data:byte(1, 4)
-	if a == 0x50 and b == 0x4B and ((c == 0x03 and d == 0x04) or (c == 0x05 and d == 0x06)) then
-		return zipEntries(data)
+	if sniff(data) == "zip" then return zipEntries(data) end
+	return tarEntries(tarData(data))
+end
+
+-- ── streaming extract ─────────────────────────────────────────────────────────
+
+--- Detect the format of an archive file on disk from its first bytes.
+---@param src string
+---@return Archive.Format
+local function sniffFile(src)
+	local f = io.open(src, "rb")
+	if not f then return "tar" end -- let the read fail with a clearer error later
+	local head = f:read(4) or ""
+	f:close()
+	return sniff(head)
+end
+
+--- Extract the entries of an in-memory tar (already decompressed) to disk,
+--- one file at a time.
+---@param data string
+---@param toPath string
+---@param strip boolean
+local function tarExtractString(data, toPath, strip)
+	local dptr = ffi.cast("const uint8_t *", data)
+	for name, size, mode, isDir, dataOff in tarIter(data) do
+		if strip then name = name:match("^[^/]*/(.+)") or name end
+		if isDir then
+			fs.mkdirAll(path.join(toPath, name))
+		else
+			writeFile(toPath, name, ffi.string(dptr + dataOff, size), mode)
+		end
 	end
-	local raw = a == 0x1F and b == 0x8B
-		and deflate.gzipDecompress(data, math.max(#data * 10, 1024 * 1024))
-		or data
-	return tarEntries(raw)
+end
+
+--- Extract the entries of an in-memory zip archive to disk, one file at a time.
+---@param data string
+---@param toPath string
+---@param strip boolean
+local function zipExtractString(data, toPath, strip)
+	local dptr = ffi.cast("const uint8_t *", data)
+	for _, info in ipairs(zipCDEntries(data)) do
+		local name = info.name
+		if strip then name = name:match("^[^/]*/(.+)") or name end
+		if info.dir then
+			fs.mkdirAll(path.join(toPath, name))
+		else
+			---@type ZipLocal
+			local lh  = ffi.cast("ZipLocal *", dptr + info.offset)
+			local raw = ffi.string(dptr + info.offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen, info.compSize)
+			writeFile(toPath, name,
+				info.method == 0 and raw or deflate.deflateDecompress(raw, info.uncompSize),
+				info.mode)
+		end
+	end
+end
+
+--- Extract the entries of a zip file on disk to disk, one file at a time.
+--- Reads the central directory (metadata only) up front, then seeks to each
+--- entry's data and writes it before moving on, so peak memory stays flat
+--- instead of holding the whole archive and every file at once.
+---@param src string
+---@param toPath string
+---@param strip boolean
+local function zipExtractFile(src, toPath, strip)
+	local f = assert(io.open(src, "rb"), "cannot open: " .. src)
+	local ok, err = pcall(function()
+		-- The EOCD sits at the end of the file; a comment of up to 64 KiB may follow it.
+		local size    = f:seek("end")
+		local tailLen = math.min(size, 22 + 65535)
+		f:seek("set", size - tailLen)
+		local tail = assert(f:read(tailLen), "ZIP: truncated file")
+
+		local tptr    = ffi.cast("const uint8_t *", tail)
+		local eocdOff = tailLen - 22
+		while eocdOff >= 0 and ffi.cast("ZipEOCD *", tptr + eocdOff).sig ~= 0x06054b50 do
+			eocdOff = eocdOff - 1
+		end
+		assert(eocdOff >= 0, "ZIP: EOCD not found")
+		---@type ZipEOCD
+		local eocd = ffi.cast("ZipEOCD *", tptr + eocdOff)
+
+		f:seek("set", eocd.cdOffset)
+		local cd    = assert(f:read(eocd.cdSize), "ZIP: truncated central directory")
+		local cdptr = ffi.cast("const uint8_t *", cd)
+		local cdPos = 0
+		for _ = 1, eocd.total do
+			---@type ZipCD
+			local e = ffi.cast("ZipCD *", cdptr + cdPos)
+			assert(e.sig == 0x02014b50, "ZIP: bad CD entry")
+			local name = ffi.string(cdptr + cdPos + ffi.sizeof("ZipCD"), e.nameLen)
+			local offset, compSize, uncompSize, method, mode =
+				e.offset, e.compSize, e.uncompSize, e.method, bit.rshift(e.eattr, 16)
+			cdPos = cdPos + ffi.sizeof("ZipCD") + e.nameLen + e.extraLen + e.commentLen
+
+			if strip then name = name:match("^[^/]*/(.+)") or name end
+			if name:sub(-1) == "/" then
+				fs.mkdirAll(path.join(toPath, name))
+			else
+				-- Skip the local header (name/extra lengths) to reach the data.
+				f:seek("set", offset)
+				local lhRaw = assert(f:read(ffi.sizeof("ZipLocal")), "ZIP: truncated local header")
+				---@type ZipLocal
+				local lh    = ffi.cast("ZipLocal *", ffi.cast("const uint8_t *", lhRaw))
+				f:seek("set", offset + ffi.sizeof("ZipLocal") + lh.nameLen + lh.extraLen)
+				local raw = assert(f:read(compSize), "ZIP: truncated entry data")
+				writeFile(toPath, name,
+					method == 0 and raw or deflate.deflateDecompress(raw, uncompSize),
+					mode)
+			end
+		end
+	end)
+	f:close()
+	if not ok then error(err, 0) end
+end
+
+--- Extract an in-memory archive to disk, one entry at a time.
+---@param data string
+---@param toPath string
+---@param strip boolean
+local function extractStream(data, toPath, strip)
+	if sniff(data) == "zip" then
+		zipExtractString(data, toPath, strip)
+	else
+		tarExtractString(tarData(data), toPath, strip)
+	end
 end
 
 -- ── TAR save ─────────────────────────────────────────────────────────────────
@@ -300,6 +505,7 @@ Archive.__index = Archive
 
 ---@class Archive.ExtractOptions
 ---@field stripComponents boolean?
+---@field stream boolean? # Stream entries one at a time (default true)
 
 --- Heuristic: does the string look like raw archive bytes rather than a path?
 --- Matches zip local headers / empty-zip EOCDs ("PK.."), gzip streams, and
@@ -356,6 +562,10 @@ function Archive:_decode()
 end
 
 --- Extract the archive to the given output directory.
+--- Extraction streams by default: entries are decompressed and written one at
+--- a time, keeping peak memory flat (~one file's worth) instead of decoding
+--- every file into memory up front. Pass `opts.stream = false` to opt out
+--- (decodes everything up front; only worth it for tiny archives).
 ---@param toPath string
 ---@param opts   Archive.ExtractOptions?
 ---@return boolean ok
@@ -366,17 +576,38 @@ function Archive:extract(toPath, opts)
 	end
 
 	local ok, err = pcall(function()
-		local entries, derr = self:_decode()
-		if not entries then error(derr) end
-
 		local strip = opts and opts.stripComponents or false
 		fs.mkdir(toPath)
-		for name, entry in pairs(entries) do
-			if strip then name = name:match("^[^/]*/(.+)") or name end
-			if entry.dir then
-				fs.mkdirAll(path.join(toPath, name))
+
+		if opts and opts.stream == false then
+			-- Opted out of streaming: decode everything into memory, then write.
+			local entries, derr = self:_decode()
+			if not entries then error(derr) end
+			for name, entry in pairs(entries) do
+				if strip then name = name:match("^[^/]*/(.+)") or name end
+				if entry.dir then
+					fs.mkdirAll(path.join(toPath, name))
+				else
+					writeFile(toPath, name, entry.content, entry.mode)
+				end
+			end
+			return
+		end
+
+		-- Streaming fast path (default): decompress and write one entry at a time.
+		if self._data then
+			extractStream(self._data, toPath, strip)
+		else
+			local src = self._source
+			if type(src) ~= "string" then
+				error("archive is not backed by file data")
+			end
+			if sniffFile(src) == "zip" then
+				zipExtractFile(src, toPath, strip)
 			else
-				writeFile(toPath, name, entry.content, entry.mode)
+				local data = fs.read(src)
+				if not data then error("cannot open: " .. src) end
+				tarExtractString(tarData(data), toPath, strip)
 			end
 		end
 	end)

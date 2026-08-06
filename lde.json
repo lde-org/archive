@@ -11,6 +11,7 @@
 		"lde-test": { "git": "https://github.com/lde-org/lde" },
 		"fs": { "git": "https://github.com/lde-org/fs" },
 		"env": { "git": "https://github.com/lde-org/env" },
-		"path": { "git": "https://github.com/lde-org/path" }
+		"path": { "git": "https://github.com/lde-org/path" },
+		"process": { "git": "https://github.com/lde-org/process" }
 	}
 }

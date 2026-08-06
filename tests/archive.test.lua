@@ -379,3 +379,217 @@ test.it("save fails when constructed from raw content", function()
 	test.falsy(ok)
 	test.truthy(err)
 end)
+
+--
+-- Legacy extraction (opts.stream = false): the opt-out path decodes every
+-- file into memory up front, then writes. Streaming is the default now, so
+-- the tests above exercise the streaming path; these keep the legacy path
+-- covered and the output must be identical.
+--
+
+test.it("extracts a .zip archive with stream = false", function()
+	local zipPath = tmp("legacy.zip")
+	local outDir = tmp("out-legacy-zip")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["hello.txt"] = "legacy zip content" })
+	local ok = a:save(zipPath)
+	test.truthy(ok)
+
+	local b = Archive.new(zipPath)
+	local ok2 = b:extract(outDir, { stream = false })
+	test.truthy(ok2)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "legacy zip content")
+end)
+
+test.it("extract honors an explicit stream = true", function()
+	local zipPath = tmp("explicit-stream.zip")
+	local outDir = tmp("out-explicit-stream")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["hello.txt"] = "explicit stream content" })
+	a:save(zipPath)
+
+	local b = Archive.new(zipPath)
+	local ok = b:extract(outDir, { stream = true })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "explicit stream content")
+end)
+
+test.it("extracts zip with deeply nested files and no explicit dir entries with stream = false", function()
+	local zipPath = tmp("legacy-nested.zip")
+	local outDir  = tmp("out-legacy-nested")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["a/b/c/deep.lua"] = "deep legacy content" })
+	a:save(zipPath)
+
+	local b = Archive.new(zipPath)
+	local ok = b:extract(outDir, { stream = false })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "a/b/c/deep.lua")), "deep legacy content")
+end)
+
+test.it("strips top-level dir from zip with stream = false", function()
+	local zipPath = tmp("legacy-strip.zip")
+	local outDir = tmp("out-legacy-strip-zip")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["topdir/hello.txt"] = "stripped legacy" })
+	a:save(zipPath)
+
+	local b = Archive.new(zipPath)
+	local ok = b:extract(outDir, { stream = false, stripComponents = true })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "stripped legacy")
+end)
+
+test.it("extracts raw zip bytes to disk with stream = false", function()
+	local zipPath = tmp("legacy-raw.zip")
+	Archive.new({ ["hello.txt"] = "raw legacy content" }):save(zipPath)
+	local raw = fs.read(zipPath)
+	fs.delete(zipPath)
+
+	local outDir = tmp("out-legacy-raw-zip")
+	fs.mkdir(outDir)
+	local ok = Archive.new(raw):extract(outDir, { stream = false })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "raw legacy content")
+end)
+
+test.it("handles raw empty zip contents with stream = false", function()
+	local zipPath = tmp("legacy-raw-empty.zip")
+	Archive.new({}):save(zipPath)
+	local raw = fs.read(zipPath)
+	fs.delete(zipPath)
+
+	local outDir = tmp("out-legacy-raw-empty")
+	fs.mkdir(outDir)
+	test.truthy(Archive.new(raw):extract(outDir, { stream = false }))
+end)
+
+test.it("extracts a .tar archive with stream = false", function()
+	local tarPath = tmp("legacy.tar")
+	local outDir = tmp("out-legacy-tar")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["hello.txt"] = "legacy tar content" })
+	local ok = a:save(tarPath)
+	test.truthy(ok)
+
+	local b = Archive.new(tarPath)
+	local ok2 = b:extract(outDir, { stream = false })
+	test.truthy(ok2)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "legacy tar content")
+end)
+
+test.it("extracts a .tar.gz archive with stream = false", function()
+	local tarPath = tmp("legacy.tar.gz")
+	local outDir = tmp("out-legacy-targz")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["hello.txt"] = "legacy targz content" })
+	local ok = a:save(tarPath)
+	test.truthy(ok)
+
+	local b = Archive.new(tarPath)
+	local ok2 = b:extract(outDir, { stream = false })
+	test.truthy(ok2)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "legacy targz content")
+end)
+
+test.it("strips top-level dir from tar.gz with stream = false", function()
+	local tarPath = tmp("legacy-strip.tar.gz")
+	local outDir = tmp("out-legacy-strip-tar")
+	fs.mkdir(outDir)
+
+	local a = Archive.new({ ["topdir/hello.txt"] = "stripped legacy tar" })
+	a:save(tarPath)
+
+	local b = Archive.new(tarPath)
+	local ok = b:extract(outDir, { stream = false, stripComponents = true })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "stripped legacy tar")
+end)
+
+test.it("extracts raw tar.gz bytes with stream = false", function()
+	local tarPath = tmp("legacy-raw.tar.gz")
+	Archive.new({ ["hello.txt"] = "raw legacy tar content" }):save(tarPath)
+	local raw = fs.read(tarPath)
+	fs.delete(tarPath)
+
+	local outDir = tmp("out-legacy-raw-tar")
+	fs.mkdir(outDir)
+	local ok = Archive.new(raw):extract(outDir, { stream = false })
+	test.truthy(ok)
+	test.equal(fs.read(path.join(outDir, "hello.txt")), "raw legacy tar content")
+end)
+
+test.it("preserves exec bits for real zip with stream = false", function()
+	local outDir = tmp("out-legacy-mode-zip")
+	fs.mkdir(outDir)
+
+	local ok = Archive.new("tests/data/mode-real.zip"):extract(outDir, { stream = false })
+	test.truthy(ok)
+
+	test.equal(perms(path.join(outDir, "tool.sh")), tonumber("755", 8))
+	test.equal(perms(path.join(outDir, "readme.txt")), tonumber("644", 8))
+	test.equal(perms(path.join(outDir, "run")), tonumber("700", 8))
+end)
+
+test.it("preserves exec bits for real tar.gz with stream = false", function()
+	local outDir = tmp("out-legacy-mode-tar")
+	fs.mkdir(outDir)
+
+	local ok = Archive.new("tests/data/mode-real.tar.gz"):extract(outDir, { stream = false })
+	test.truthy(ok)
+
+	test.equal(perms(path.join(outDir, "tool.sh")), tonumber("755", 8))
+	test.equal(perms(path.join(outDir, "readme.txt")), tonumber("644", 8))
+	test.equal(perms(path.join(outDir, "run")), tonumber("700", 8))
+end)
+
+-- regression: tar.gz whose payload compresses far past the old 10x size guess
+-- (e.g. repeated text) must still extract — the gzip footer's ISIZE field
+-- gives the exact uncompressed size
+local function makeCompressible(payload)
+	local block = string.rep("the quick brown fox jumps over the lazy dog. ", 64)
+	local t = {}
+	for _ = 1, math.ceil(payload / #block) do
+		t[#t + 1] = block
+	end
+	return table.concat(t):sub(1, payload)
+end
+
+test.it("tar.gz roundtrip with highly compressible payload (streaming path)", function()
+	local tarPath = tmp("big-compressible.tar.gz")
+	local outDir  = tmp("out-big-compressible")
+	fs.mkdir(outDir)
+
+	local content = makeCompressible(2 * 1024 * 1024) -- 2 MiB, compresses ~200x
+	test.truthy(#content > 1000000)
+
+	local ok = Archive.new({ ["big.txt"] = content }):save(tarPath)
+	test.truthy(ok)
+
+	local b = Archive.new(tarPath)
+	local ok2 = b:extract(outDir)
+	test.truthy(ok2)
+	test.equal(fs.read(path.join(outDir, "big.txt")), content)
+end)
+
+test.it("tar.gz roundtrip with highly compressible payload (legacy path)", function()
+	local tarPath = tmp("big-compressible-legacy.tar.gz")
+	local outDir  = tmp("out-big-compressible-legacy")
+	fs.mkdir(outDir)
+
+	local content = makeCompressible(2 * 1024 * 1024)
+
+	local ok = Archive.new({ ["big.txt"] = content }):save(tarPath)
+	test.truthy(ok)
+
+	local b = Archive.new(tarPath)
+	local ok2 = b:extract(outDir, { stream = false })
+	test.truthy(ok2)
+	test.equal(fs.read(path.join(outDir, "big.txt")), content)
+end)
