@@ -1,6 +1,7 @@
 {
 	"name": "archive",
-	"description": "Archive extraction library. Reads magic bytes to detect zip vs tar.",
+	"description": "Archive extraction and creation library. Supports zip and tar.",
+	"authors": ["David Cruz <david@bycruz.dev>"],
 	"version": "0.1.0",
 	"dependencies": {
 		"fs": { "git": "https://github.com/lde-org/fs" },
